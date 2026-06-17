@@ -70,6 +70,12 @@ web_modules/
 .env.*
 !.env.example
 
+# Scraper runtime artifacts
+scrape-wnba-backfill.checkpoint.json
+scrape-wnba-backfill.log
+wnba-player-slugs.cache.json
+wnba-teams.cache.json
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache
