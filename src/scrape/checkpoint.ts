@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { sleep } from "../utils/rateLimiter.js";
 
 export const DEFAULT_CHECKPOINT = "scrape-wnba-backfill.checkpoint.json";
 export const DEFAULT_LOG = "scrape-wnba-backfill.log";
@@ -7,6 +8,8 @@ export interface WnbaCheckpoint {
   version: 1;
   completedSlugs: string[];
   allSlugs?: string[];
+  /** Do not hit BRef before this time (ISO) after a 429. */
+  brefCooldownUntil?: string;
   updatedAt: string;
 }
 
@@ -57,6 +60,51 @@ export function markSlugComplete(
   checkpoint.updatedAt = new Date().toISOString();
   saveCheckpoint(path, checkpoint);
   return checkpoint;
+}
+
+export function setBrefCooldown(
+  checkpoint: WnbaCheckpoint,
+  cooldownHours: number,
+  path: string,
+): WnbaCheckpoint {
+  const until = Date.now() + cooldownHours * 60 * 60 * 1000;
+  checkpoint.brefCooldownUntil = new Date(until).toISOString();
+  checkpoint.updatedAt = new Date().toISOString();
+  saveCheckpoint(path, checkpoint);
+  return checkpoint;
+}
+
+export function clearBrefCooldown(
+  checkpoint: WnbaCheckpoint,
+  path: string,
+): WnbaCheckpoint {
+  delete checkpoint.brefCooldownUntil;
+  checkpoint.updatedAt = new Date().toISOString();
+  saveCheckpoint(path, checkpoint);
+  return checkpoint;
+}
+
+export function parseBrefCooldownUntil(checkpoint: WnbaCheckpoint): number | undefined {
+  if (!checkpoint.brefCooldownUntil) return undefined;
+  const ms = Date.parse(checkpoint.brefCooldownUntil);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
+export async function waitForBrefCooldown(
+  checkpoint: WnbaCheckpoint,
+  cooldownHours: number,
+): Promise<void> {
+  if (cooldownHours <= 0) return;
+
+  const until = parseBrefCooldownUntil(checkpoint);
+  if (!until || until <= Date.now()) return;
+
+  const waitMs = until - Date.now();
+  console.log(
+    `[bref] saved cooldown — waiting ${Math.round(waitMs / 60000)} min ` +
+      `(until ${checkpoint.brefCooldownUntil})...`,
+  );
+  await sleep(waitMs);
 }
 
 export function appendLog(path: string, line: string): void {

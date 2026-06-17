@@ -1,9 +1,12 @@
-import { backoffMs, jitterMs, parseRetryAfterMs, sleep } from "./utils/rateLimiter.js";
+import { buildBrefHeaders } from "./utils/browserHeaders.js";
+import {
+  backoffMs,
+  parseRetryAfterMs,
+  randomDelayMs,
+  sleep,
+} from "./utils/rateLimiter.js";
 import { parseWnbaBioFromHtml } from "./utils/profile.js";
 import type { WnbaPlayerMeta } from "./types.js";
-
-const USER_AGENT =
-  "Mozilla/5.0 (compatible; HoopCentralWNBAScraper/1.0; +https://github.com/hoopcentral)";
 
 export class BrefClientError extends Error {
   constructor(message: string) {
@@ -19,18 +22,43 @@ export function uncommentBrefHtml(html: string): string {
   return html.replace(/<!--\s*\n/g, "").replace(/\n\s*-->/g, "");
 }
 
+export interface BrefClientOptions {
+  requestDelayMs: number;
+  indexDelayMs?: number;
+  /** Extra random spread added on top of requestDelayMs (+ penalty). */
+  jitterMaxMs?: number;
+  /** Stop after N 429 retries (backfill uses 1 short wait, not 8 hammer retries). */
+  rateLimitRetries?: number;
+  /** Wait before a 429 retry during backfill. */
+  rateLimitWaitMs?: number;
+  /** Resume after a saved checkpoint cooldown. */
+  initialCooldownUntil?: number;
+}
+
 export class BrefClient {
   private lastRequestAt = 0;
-  private cooldownUntil = 0;
+  private cooldownUntil: number;
   private penaltyDelayMs = 0;
 
-  constructor(
-    private readonly requestDelayMs: number,
-    private readonly indexDelayMs = 10_000,
-  ) {}
+  constructor(private readonly options: BrefClientOptions) {
+    this.cooldownUntil = options.initialCooldownUntil ?? 0;
+  }
+
+  private get requestDelayMs(): number {
+    return this.options.requestDelayMs;
+  }
+
+  private get indexDelayMs(): number {
+    return this.options.indexDelayMs ?? 15_000;
+  }
+
+  private get jitterMaxMs(): number {
+    return this.options.jitterMaxMs ?? 1500;
+  }
 
   private effectiveDelay(minDelayMs: number): number {
-    return minDelayMs + this.penaltyDelayMs + jitterMs(1500);
+    const base = minDelayMs + this.penaltyDelayMs;
+    return randomDelayMs(base, base + this.jitterMaxMs);
   }
 
   private decayPenalty(): void {
@@ -42,7 +70,9 @@ export class BrefClient {
   private async throttle(minDelayMs = this.requestDelayMs): Promise<void> {
     const now = Date.now();
     if (now < this.cooldownUntil) {
-      await sleep(this.cooldownUntil - now);
+      const waitMs = this.cooldownUntil - now;
+      console.error(`[bref] cooldown active, waiting ${Math.round(waitMs / 1000)}s...`);
+      await sleep(waitMs);
     }
 
     const targetDelay = this.effectiveDelay(minDelayMs);
@@ -51,6 +81,13 @@ export class BrefClient {
       await sleep(targetDelay - elapsed);
     }
     this.lastRequestAt = Date.now();
+  }
+
+  /** Extra breathing room between players during backfill. */
+  async restBetweenPlayers(minMs = 3000, maxMs = 8000): Promise<void> {
+    const restMs = randomDelayMs(minMs, maxMs);
+    console.log(`[bref] resting ${Math.round(restMs / 1000)}s before next player...`);
+    await sleep(restMs);
   }
 
   private async applyRateLimitCooldown(response: Response, attempt: number): Promise<void> {
@@ -65,20 +102,22 @@ export class BrefClient {
     await sleep(waitMs);
   }
 
-  async fetchHtml(url: string, retries = 8): Promise<string> {
-    for (let attempt = 1; attempt <= retries; attempt += 1) {
+  async fetchHtml(url: string, referer?: string, retries = 8): Promise<string> {
+    const maxRateLimitRetries = this.options.rateLimitRetries ?? 0;
+    let rateLimitHits = 0;
+    const rateLimitWaitMs = this.options.rateLimitWaitMs ?? 90_000;
+    const maxAttempts = retries;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       await this.throttle();
 
       let response: Response;
       try {
         response = await fetch(url, {
-          headers: {
-            "User-Agent": USER_AGENT,
-            Accept: "text/html,application/xhtml+xml",
-          },
+          headers: buildBrefHeaders(referer),
         });
       } catch (error) {
-        if (attempt === retries) {
+        if (attempt === maxAttempts) {
           const message = error instanceof Error ? error.message : String(error);
           throw new BrefClientError(message);
         }
@@ -87,13 +126,22 @@ export class BrefClient {
       }
 
       if (response.status === 429 || response.status === 503) {
-        if (attempt < retries) {
-          await this.applyRateLimitCooldown(response, attempt);
+        if (rateLimitHits < maxRateLimitRetries) {
+          rateLimitHits += 1;
+          const retryAfterMs = parseRetryAfterMs(response.headers.get("Retry-After"));
+          const waitMs = retryAfterMs ?? rateLimitWaitMs;
+          this.penaltyDelayMs = Math.min(15_000, this.penaltyDelayMs + 3000);
+          console.error(
+            `[bref] rate limited (${response.status}), pausing ${Math.round(waitMs / 1000)}s ` +
+              `then retrying (${rateLimitHits}/${maxRateLimitRetries})...`,
+          );
+          await sleep(waitMs);
+          attempt -= 1;
           continue;
         }
         throw new BrefRateLimitError(`BRef rate limited (${response.status}): ${url}`);
       } else if (response.status >= 500) {
-        if (attempt < retries) {
+        if (attempt < maxAttempts) {
           await sleep(backoffMs(attempt, 3000));
           continue;
         }
@@ -124,7 +172,10 @@ export class BrefClient {
   }
 
   async listSlugsForLetter(letter: string): Promise<string[]> {
-    const html = await this.fetchHtml(this.indexUrl(letter));
+    const html = await this.fetchHtml(
+      this.indexUrl(letter),
+      "https://www.basketball-reference.com/wnba/players/",
+    );
     const slugs = new Set<string>();
 
     for (const match of html.matchAll(/href="\/wnba\/players\/[a-z]\/([a-z0-9]+)\.html"/gi)) {

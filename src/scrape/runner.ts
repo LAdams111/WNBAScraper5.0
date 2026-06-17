@@ -4,12 +4,17 @@ import { IngestClient } from "../ingestClient.js";
 import { toIngestPayload } from "../transform.js";
 import type { ScrapeOptions, ScrapeSummary } from "../types.js";
 import { metaToIngestPlayer } from "../utils/profile.js";
+import { sleep } from "../utils/rateLimiter.js";
 import {
   appendLog,
+  clearBrefCooldown,
   ensureCheckpoint,
   loadCheckpoint,
   markSlugComplete,
+  parseBrefCooldownUntil,
   saveCheckpointSlugs,
+  setBrefCooldown,
+  waitForBrefCooldown,
 } from "./checkpoint.js";
 import { buildPlayerSeasonRecords } from "./playerSeason.js";
 import { loadSlugCache, saveSlugCache } from "./slugCache.js";
@@ -20,7 +25,8 @@ async function processPlayer(
   options: ScrapeOptions,
   slug: string,
 ): Promise<{ ok: boolean; seasonRows: number; playerId?: number }> {
-  const html = await bref.fetchHtml(bref.playerUrl(slug));
+  const playerUrl = bref.playerUrl(slug);
+  const html = await bref.fetchHtml(playerUrl, bref.indexUrl(slug.slice(0, 1)));
   const pageHtml = uncommentBrefHtml(html);
   const meta = bref.parsePlayerMeta(slug, pageHtml);
   const records = await buildPlayerSeasonRecords(
@@ -79,20 +85,35 @@ export async function runScrape(
   config: AppConfig,
   options: ScrapeOptions,
 ): Promise<{ summary: ScrapeSummary }> {
-  const bref = new BrefClient(options.requestDelayMs, options.indexDelayMs);
+  let checkpoint = ensureCheckpoint(
+    options.resume ? loadCheckpoint(options.checkpointPath) : null,
+  );
+
+  await waitForBrefCooldown(checkpoint, config.brefCooldownHours);
+
+  const bref = new BrefClient({
+    requestDelayMs: options.requestDelayMs,
+    indexDelayMs: options.indexDelayMs,
+    jitterMaxMs: options.backfill ? 10_000 : 1500,
+    rateLimitRetries: config.brefRateLimitRetries,
+    rateLimitWaitMs: config.brefRateLimitWaitMs,
+    initialCooldownUntil:
+      config.brefCooldownHours > 0 ? parseBrefCooldownUntil(checkpoint) : undefined,
+  });
   const ingest = new IngestClient(config.hoopCentralApiUrl, config.ingestApiKey);
 
   if (options.backfill) {
     console.log(
-      `BRef pacing: ${options.requestDelayMs}ms between requests, ` +
-        `${options.indexDelayMs}ms between index letters (+ jitter, slows further after 429).`,
+      `BRef pacing: ${options.requestDelayMs}–${options.requestDelayMs + 10_000}ms between requests ` +
+        `(random), ${options.indexDelayMs}ms between index letters, 5–12s rest between players, ` +
+        `1× inline pause on 429 then retry same player.`,
     );
     console.log("");
   }
 
-  let checkpoint = ensureCheckpoint(
-    options.resume ? loadCheckpoint(options.checkpointPath) : null,
-  );
+  if (config.brefCooldownHours > 0 && parseBrefCooldownUntil(checkpoint)) {
+    checkpoint = clearBrefCooldown(checkpoint, options.checkpointPath);
+  }
 
   let slugs: string[];
   if (options.playerSlug) {
@@ -110,9 +131,22 @@ export async function runScrape(
         slugs = await bref.listAllSlugs();
       } catch (error) {
         if (error instanceof BrefRateLimitError) {
+          if (config.brefCooldownHours > 0) {
+            checkpoint = setBrefCooldown(
+              checkpoint,
+              config.brefCooldownHours,
+              options.checkpointPath,
+            );
+          }
           console.error("");
           console.error("BRef rate limit hit during index crawl.");
-          console.error("Wait 1–2 hours, then rerun with --resume.");
+          if (config.brefCooldownHours > 0) {
+            console.error(
+              `Wait ${config.brefCooldownHours} hour(s), then rerun with --resume.`,
+            );
+          } else {
+            console.error("Rerun with --resume after a short break.");
+          }
           throw error;
         }
         throw error;
@@ -139,29 +173,39 @@ export async function runScrape(
     summary.processed += 1;
     console.log(`\n[${summary.processed}/${toProcess.length}] ${slug}`);
 
-    try {
-      const result = await processPlayer(bref, ingest, options, slug);
-      if (result.ok) {
-        summary.succeeded += 1;
-        summary.seasonRows += result.seasonRows;
-        if (!options.dryRun && result.seasonRows > 0) {
-          markSlugComplete(checkpoint, slug, options.checkpointPath);
+    let done = false;
+    while (!done) {
+      try {
+        const result = await processPlayer(bref, ingest, options, slug);
+        if (result.ok) {
+          summary.succeeded += 1;
+          summary.seasonRows += result.seasonRows;
+          if (!options.dryRun && result.seasonRows > 0) {
+            markSlugComplete(checkpoint, slug, options.checkpointPath);
+          }
+          if (options.backfill && !options.dryRun && summary.processed < toProcess.length) {
+            await bref.restBetweenPlayers(5000, 12_000);
+          }
+        } else {
+          summary.failed += 1;
+          appendLog(options.logPath, `FAIL ${slug}`);
         }
-      } else {
-        summary.failed += 1;
-        appendLog(options.logPath, `FAIL ${slug}`);
-      }
-    } catch (error) {
-      summary.failed += 1;
-      const message = error instanceof Error ? error.message : String(error);
-      appendLog(options.logPath, `FAIL ${slug}: ${message}`);
-      console.error(`[error] ${slug}: ${message}`);
+        done = true;
+      } catch (error) {
+        if (error instanceof BrefRateLimitError && options.backfill) {
+          const waitMs = config.brefRateLimitWaitMs;
+          console.error(
+            `[bref] blocked on ${slug}, waiting ${Math.round(waitMs / 1000)}s then retrying...`,
+          );
+          await sleep(waitMs);
+          continue;
+        }
 
-      if (error instanceof BrefRateLimitError) {
-        console.error("");
-        console.error("Stopping backfill — BRef rate limit reached.");
-        console.error("Wait 1–2 hours, then rerun with --resume.");
-        break;
+        summary.failed += 1;
+        const message = error instanceof Error ? error.message : String(error);
+        appendLog(options.logPath, `FAIL ${slug}: ${message}`);
+        console.error(`[error] ${slug}: ${message}`);
+        done = true;
       }
     }
   }

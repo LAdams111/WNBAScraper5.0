@@ -46,8 +46,15 @@ npm run scrape:backfill -- --resume
 
 - **Stats only** — WNBA per-game tables (`#wnba_per_game`, comment-wrapped full career table)
 - **WNBA-only players** — created via season ingest with BRef bio fields (name, birth date, position, height, weight)
-- **Rate limiting** — 6s/player, 10s/index letter, jitter, 429 backoff (mirrors G-League-Scraper)
+- **Rate limiting** — 10s/player (random +0–5s), 15s/index letter, 3–8s rest between players, fail-fast on 429, 2h saved cooldown
 - **Checkpoint/resume** — `scrape-wnba-backfill.checkpoint.json` tracks completed slugs
+
+## Avoiding BRef blocks
+
+- **Do not run multiple scrapers in parallel** — that increases 429s, not throughput.
+- On 429 the scraper **stops immediately** (no retry hammering) and saves `brefCooldownUntil` in the checkpoint.
+- Resume with `--resume`; it waits out the saved cooldown automatically.
+- Increase delays in `.env` if needed (`SCRAPE_REQUEST_DELAY_MS=12000` or higher).
 
 ## Runtime files (gitignored)
 

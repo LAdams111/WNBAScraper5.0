@@ -256,6 +256,7 @@ export async function buildPlayerSeasonRecords(
   teamCachePath: string,
 ): Promise<WnbaPlayerSeasonRecord[]> {
   const seasonRows = parseSeasonRowsFromHtml(html);
+  const playerUrl = bref.playerUrl(slug);
   const cache = loadTeamCache(teamCachePath);
   const records: WnbaPlayerSeasonRecord[] = [];
 
@@ -266,6 +267,7 @@ export async function buildPlayerSeasonRecords(
       row.teamAbbreviation,
       row.teamSeasonYear,
       teamCachePath,
+      playerUrl,
     );
     records.push(
       buildPlayerSeasonRecord({
@@ -295,11 +297,14 @@ async function resolveTeam(
   abbrev: string,
   seasonYear: number,
   teamCachePath: string,
+  playerReferer: string,
 ) {
   const cached = getCachedTeam(cache, abbrev, seasonYear);
   if (cached) return cached;
 
-  const teamHtml = uncommentBrefHtml(await bref.fetchHtml(bref.teamUrl(abbrev, seasonYear)));
+  const teamHtml = uncommentBrefHtml(
+    await bref.fetchHtml(bref.teamUrl(abbrev, seasonYear), playerReferer),
+  );
   const fullName = bref.parseTeamNameFromTitle(teamHtml);
   const entry = setCachedTeam(cache, abbrev, seasonYear, fullName);
   saveTeamCache(teamCachePath, cache);

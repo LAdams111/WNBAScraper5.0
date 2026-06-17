@@ -28,3 +28,9 @@ export function backoffMs(attempt: number, baseMs = 5000, maxMs = 120_000): numb
 export function jitterMs(maxMs = 1500): number {
   return Math.floor(Math.random() * maxMs);
 }
+
+/** Random delay in [minMs, maxMs] — less periodic than fixed delay + jitter. */
+export function randomDelayMs(minMs: number, maxMs: number): number {
+  if (maxMs <= minMs) return minMs;
+  return minMs + Math.floor(Math.random() * (maxMs - minMs + 1));
+}

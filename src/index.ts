@@ -37,7 +37,7 @@ Examples:
 `);
 }
 
-function parseArgs(argv: string[]): ScrapeOptions & { showHelp: boolean } {
+function parseArgs(argv: string[]): ScrapeOptions & { showHelp: boolean; cliDelayMs: boolean } {
   let backfill = false;
   let dryRun = false;
   let resume = false;
@@ -46,6 +46,7 @@ function parseArgs(argv: string[]): ScrapeOptions & { showHelp: boolean } {
   let limit: number | undefined;
   let playerSlug: string | undefined;
   let requestDelayMs: number | undefined;
+  let cliDelayMs = false;
   let showHelp = false;
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -89,6 +90,7 @@ function parseArgs(argv: string[]): ScrapeOptions & { showHelp: boolean } {
         const value = argv[++i];
         if (!value) throw new Error("--delay requires a value");
         requestDelayMs = Number.parseInt(value, 10);
+        cliDelayMs = true;
         if (Number.isNaN(requestDelayMs) || requestDelayMs < 0) {
           throw new Error(`Invalid delay: ${value}`);
         }
@@ -117,6 +119,7 @@ function parseArgs(argv: string[]): ScrapeOptions & { showHelp: boolean } {
     logPath: DEFAULT_LOG,
     slugCachePath: DEFAULT_SLUG_CACHE,
     teamCachePath: DEFAULT_TEAM_CACHE,
+    cliDelayMs,
     showHelp,
   };
 }
@@ -139,7 +142,22 @@ async function main(): Promise<void> {
     process.exit(health.ok ? 0 : 1);
   }
 
-  const { showHelp: _showHelp, health: _health, ...scrapeOptions } = args;
+  const { showHelp: _showHelp, health: _health, cliDelayMs, ...scrapeOptions } = args;
+
+  if (!cliDelayMs) {
+    scrapeOptions.requestDelayMs = config.requestDelayMs;
+    scrapeOptions.indexDelayMs = config.indexDelayMs;
+  }
+  if (scrapeOptions.backfill) {
+    scrapeOptions.requestDelayMs = Math.max(
+      scrapeOptions.requestDelayMs,
+      BACKFILL_PLAYER_DELAY_MS,
+    );
+    scrapeOptions.indexDelayMs = Math.max(
+      scrapeOptions.indexDelayMs,
+      BACKFILL_INDEX_DELAY_MS,
+    );
+  }
 
   console.log("Starting WNBA-Scraper");
   console.log(`Target: ${config.hoopCentralApiUrl}`);

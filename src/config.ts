@@ -27,16 +27,22 @@ export interface AppConfig {
   ingestApiKey: string | null;
   requestDelayMs: number;
   indexDelayMs: number;
+  brefCooldownHours: number;
+  brefRateLimitWaitMs: number;
+  brefRateLimitRetries: number;
 }
 
 /** Default delay between BRef player page fetches (single-player / testing). */
 export const DEFAULT_PLAYER_DELAY_MS = 6000;
 
-/** Conservative backfill pacing. */
-export const BACKFILL_PLAYER_DELAY_MS = 6000;
+/** Conservative backfill pacing (each player also fetches uncached team pages). */
+export const BACKFILL_PLAYER_DELAY_MS = 20_000;
 
 /** Delay between A–Z index letter pages during backfill. */
-export const BACKFILL_INDEX_DELAY_MS = 10_000;
+export const BACKFILL_INDEX_DELAY_MS = 20_000;
+
+/** Saved cooldown after 429 — set BREF_COOLDOWN_HOURS=0 to disable waiting on resume. */
+export const DEFAULT_BREF_COOLDOWN_HOURS = 0;
 
 export function loadConfig(): AppConfig {
   const hoopCentralApiUrl = normalizeBaseUrl(
@@ -58,6 +64,18 @@ export function loadConfig(): AppConfig {
     indexDelayMs: parseOptionalInt(
       process.env.SCRAPE_INDEX_DELAY_MS,
       BACKFILL_INDEX_DELAY_MS,
+    ),
+    brefCooldownHours: parseOptionalInt(
+      process.env.BREF_COOLDOWN_HOURS,
+      DEFAULT_BREF_COOLDOWN_HOURS,
+    ),
+    brefRateLimitWaitMs: parseOptionalInt(
+      process.env.BREF_RATE_LIMIT_WAIT_MS,
+      90_000,
+    ),
+    brefRateLimitRetries: parseOptionalInt(
+      process.env.BREF_RATE_LIMIT_RETRIES,
+      1,
     ),
   };
 }
